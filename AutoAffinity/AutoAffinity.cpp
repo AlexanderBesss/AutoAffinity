@@ -1,4 +1,3 @@
-#pragma comment(linker, "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
 
@@ -7,64 +6,75 @@
 #include "resource.h"
 #include <commctrl.h>
 #include <tlhelp32.h>
-#include <string>
-#include <vector>
-#include <map>
-#include <set>
-#include <sstream>
-#include <iomanip>
-#include <atomic>
-#include <thread>
+#include <stdio.h>
 
 #define WM_TRAYICON  (WM_APP + 1)
-#define WM_LOG_MSG   (WM_APP + 2)
 
 #define IDM_SHOW     1001
 #define IDM_EXIT     1002
 #define IDM_STARTUP  1003
 #define IDM_ABOUT    1004
 
-#define ID_EDIT_LOG  100
-#define ID_STATUSBAR 101
-#define TRAY_ICON_ID 1
+#define ID_EDIT_LOG   100
+#define ID_STATUSBAR  101
+#define ID_TIMER_POLL 102
+#define TRAY_ICON_ID  1
 
-static HINSTANCE         g_hInst        = nullptr;
-static HWND              g_hwnd         = nullptr;
-static HWND              g_hEdit        = nullptr;
-static HWND              g_hStatus      = nullptr;
-static NOTIFYICONDATAW   g_nid          = {};
-static std::atomic<bool> g_running      { true };
-static DWORD_PTR         g_affinityMask = 0;
-static HFONT             g_hFont        = nullptr;
+static HINSTANCE       g_hInst        = nullptr;
+static HWND            g_hwnd         = nullptr;
+static HWND            g_hEdit        = nullptr;
+static HWND            g_hStatus      = nullptr;
+static NOTIFYICONDATAW g_nid          = {};
+static DWORD_PTR       g_affinityMask = 0;
+static HFONT           g_hFont        = nullptr;
 
-static const std::vector<std::wstring> k_targets = { L"cs2.exe", L"dota2.exe" };
-static const DWORD k_pollMs = 20000;
+static const wchar_t* const k_targets[] = { L"cs2.exe", L"dota2.exe" };
+static constexpr int   k_numTargets = _countof(k_targets);
+static const UINT      k_pollMs     = 20000;
+static constexpr int   k_maxPids    = 8; // max tracked PIDs per target
+
+struct TargetState {
+    DWORD pids[k_maxPids];
+    int   count;
+};
+static TargetState g_known[k_numTargets] = {};
 
 // ---------------------------------------------------------------------------
 // Affinity mask
 // ---------------------------------------------------------------------------
 
 static DWORD_PTR BuildAffinityMask() {
-    DWORD_PTR proc, sys;
+    DWORD_PTR proc = 0, sys = 0;
     GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
     return sys & ~(DWORD_PTR)0x3; // exclude logical CPUs 0 and 1
 }
 
 // ---------------------------------------------------------------------------
-// Thread-safe logging
+// Logging
 // ---------------------------------------------------------------------------
 
-static void Log(const wchar_t* level, const std::wstring& msg) {
+static void AppendLog(const wchar_t* line) {
+    // Keep at most 1000 lines - trim the first 200 when exceeded
+    if (SendMessageW(g_hEdit, EM_GETLINECOUNT, 0, 0) > 1000) {
+        LRESULT trimTo = SendMessageW(g_hEdit, EM_LINEINDEX, 200, 0);
+        SendMessageW(g_hEdit, EM_SETSEL, 0, trimTo);
+        SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
+    }
+
+    LRESULT len = SendMessageW(g_hEdit, WM_GETTEXTLENGTH, 0, 0);
+    SendMessageW(g_hEdit, EM_SETSEL, len, len);
+    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)line);
+    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
+    SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
+}
+
+static void Log(const wchar_t* level, const wchar_t* msg) {
     SYSTEMTIME st{};
     GetLocalTime(&st);
-    std::wostringstream ss;
-    ss << L"[" << std::setfill(L'0')
-       << std::setw(2) << st.wHour   << L":"
-       << std::setw(2) << st.wMinute << L":"
-       << std::setw(2) << st.wSecond << L"] "
-       << level << L" " << msg;
-    PostMessageW(g_hwnd, WM_LOG_MSG, 0,
-        reinterpret_cast<LPARAM>(new std::wstring(ss.str())));
+    wchar_t buf[512];
+    swprintf_s(buf, L"[%02hu:%02hu:%02hu] %s %s",
+        st.wHour, st.wMinute, st.wSecond, level, msg);
+    AppendLog(buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -75,9 +85,9 @@ static void CheckAndApply(DWORD pid, const wchar_t* name, bool isNew) {
     HANDLE h = OpenProcess(
         PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, pid);
     if (!h) {
-        std::wostringstream s;
-        s << name << L" PID " << pid << L" - OpenProcess failed (" << GetLastError() << L")";
-        Log(L"[!]", s.str());
+        wchar_t s[256];
+        swprintf_s(s, L"%s PID %lu - OpenProcess failed (%lu)", name, pid, GetLastError());
+        Log(L"[!]", s);
         return;
     }
 
@@ -92,57 +102,82 @@ static void CheckAndApply(DWORD pid, const wchar_t* name, bool isNew) {
     }
 
     {
-        std::wostringstream s;
-        s << name << L" (PID " << pid << L")"
-          << (isNew ? L" - new process" : L" - drift detected, reapplying");
-        Log(L"[*]", s.str());
+        wchar_t s[256];
+        swprintf_s(s, L"%s (PID %lu)%s", name, pid,
+            isNew ? L" - new process" : L" - drift detected, reapplying");
+        Log(L"[*]", s);
     }
 
     if (priorityDrifted || isNew) {
         if (SetPriorityClass(h, HIGH_PRIORITY_CLASS))
             Log(L"[+]", L"    Priority  -> High");
         else {
-            std::wostringstream e;
-            e << L"    SetPriorityClass failed (" << GetLastError() << L")";
-            Log(L"[!]", e.str());
+            wchar_t e[128];
+            swprintf_s(e, L"    SetPriorityClass failed (%lu)", GetLastError());
+            Log(L"[!]", e);
         }
     }
 
     if (affinityDrifted || isNew) {
         if (SetProcessAffinityMask(h, g_affinityMask)) {
-            std::wostringstream a;
-            a << L"    Affinity  -> 0x" << std::hex << g_affinityMask
-              << L" (CPUs 0+1 excluded)";
-            Log(L"[+]", a.str());
+            wchar_t a[128];
+            swprintf_s(a, L"    Affinity  -> 0x%llX (CPUs 0+1 excluded)",
+                (unsigned long long)g_affinityMask);
+            Log(L"[+]", a);
         } else {
-            std::wostringstream e;
-            e << L"    SetProcessAffinityMask failed (" << GetLastError() << L")";
-            Log(L"[!]", e.str());
+            wchar_t e[128];
+            swprintf_s(e, L"    SetProcessAffinityMask failed (%lu)", GetLastError());
+            Log(L"[!]", e);
         }
     }
 
     CloseHandle(h);
 }
 
-static std::map<std::wstring, std::set<DWORD>> SnapshotTargets(
-    const std::vector<std::wstring>& targets)
-{
-    std::map<std::wstring, std::set<DWORD>> result;
-    for (const auto& t : targets) result[t];
+static bool ContainsPid(const TargetState& ts, DWORD pid) {
+    for (int i = 0; i < ts.count; ++i)
+        if (ts.pids[i] == pid) return true;
+    return false;
+}
 
+static void WatcherTick() {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return result;
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+
+    // Collect current PIDs per target
+    TargetState current[k_numTargets] = {};
 
     PROCESSENTRY32W pe{ sizeof(pe) };
     if (Process32FirstW(hSnap, &pe))
         do {
-            for (auto& [name, pids] : result)
-                if (_wcsicmp(pe.szExeFile, name.c_str()) == 0)
-                    pids.insert(pe.th32ProcessID);
+            for (int i = 0; i < k_numTargets; ++i)
+                if (_wcsicmp(pe.szExeFile, k_targets[i]) == 0
+                    && current[i].count < k_maxPids)
+                    current[i].pids[current[i].count++] = pe.th32ProcessID;
         } while (Process32NextW(hSnap, &pe));
 
     CloseHandle(hSnap);
-    return result;
+
+    for (int i = 0; i < k_numTargets; ++i) {
+        // Check new/existing PIDs
+        for (int j = 0; j < current[i].count; ++j) {
+            DWORD pid = current[i].pids[j];
+            bool isNew = !ContainsPid(g_known[i], pid);
+            if (isNew && g_known[i].count < k_maxPids)
+                g_known[i].pids[g_known[i].count++] = pid;
+            CheckAndApply(pid, k_targets[i], isNew);
+        }
+
+        // Remove exited PIDs
+        for (int j = g_known[i].count - 1; j >= 0; --j) {
+            if (!ContainsPid(current[i], g_known[i].pids[j])) {
+                wchar_t s[256];
+                swprintf_s(s, L"%s (PID %lu) exited.", k_targets[i], g_known[i].pids[j]);
+                Log(L"[-]", s);
+                g_known[i].pids[j] = g_known[i].pids[--g_known[i].count];
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,68 +222,9 @@ static void UpdateStartupRegistration(bool enable) {
     }
 }
 
-static void RegisterStartup() {
-    // This is called on first run or every run to ensure it's there
-    // For now we keep it simple - we can make it toggleable
-    if (!IsStartupRegistered()) {
-        UpdateStartupRegistration(true);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Worker thread
-// ---------------------------------------------------------------------------
-
-static void WatcherThread() {
-    std::map<std::wstring, std::set<DWORD>> known;
-    for (const auto& t : k_targets) known[t];
-
-    while (g_running) {
-        auto current = SnapshotTargets(k_targets);
-
-        for (auto& [name, pids] : current) {
-            auto& knownPids = known[name];
-
-            for (DWORD pid : pids) {
-                bool isNew = !knownPids.count(pid);
-                if (isNew) knownPids.insert(pid);
-                CheckAndApply(pid, name.c_str(), isNew);
-            }
-
-            for (auto it = knownPids.begin(); it != knownPids.end(); )
-                if (!pids.count(*it)) {
-                    std::wostringstream s;
-                    s << name << L" (PID " << *it << L") exited.";
-                    Log(L"[-]", s.str());
-                    it = knownPids.erase(it);
-                } else {
-                    ++it;
-                }
-        }
-
-        for (DWORD i = 0; i < k_pollMs / 200 && g_running; ++i)
-            Sleep(200);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // GUI helpers
 // ---------------------------------------------------------------------------
-
-static void AppendLog(const std::wstring& line) {
-    // Keep at most 1000 lines - trim the first 200 when exceeded
-    if (SendMessageW(g_hEdit, EM_GETLINECOUNT, 0, 0) > 1000) {
-        LRESULT trimTo = SendMessageW(g_hEdit, EM_LINEINDEX, 200, 0);
-        SendMessageW(g_hEdit, EM_SETSEL, 0, trimTo);
-        SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
-    }
-
-    LRESULT len = SendMessageW(g_hEdit, WM_GETTEXTLENGTH, 0, 0);
-    SendMessageW(g_hEdit, EM_SETSEL, len, len);
-    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
-    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
-    SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
-}
 
 static void ShowMainWindow() {
     ShowWindow(g_hwnd, SW_SHOW);
@@ -314,12 +290,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hHelpMenu, L"&Help");
 
         SetMenu(hwnd, hMenuBar);
+
+        SetTimer(hwnd, ID_TIMER_POLL, k_pollMs, nullptr);
         return 0;
     }
 
+    case WM_TIMER:
+        if (wp == ID_TIMER_POLL)
+            WatcherTick();
+        return 0;
+
     case WM_INITMENUPOPUP: {
         HMENU hMenu = (HMENU)wp;
-        // Check "Run on startup" if it's registered
         CheckMenuItem(hMenu, IDM_STARTUP, MF_BYCOMMAND | (IsStartupRegistered() ? MF_CHECKED : MF_UNCHECKED));
         return 0;
     }
@@ -348,13 +330,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
             if (hMenu) {
+                bool startupOn = IsStartupRegistered();
                 AppendMenuW(hMenu, MF_STRING, IDM_SHOW,
                     IsWindowVisible(hwnd) ? L"Hide window" : L"Show window");
-
-                // Add startup toggle to tray as well
-                AppendMenuW(hMenu, MF_STRING | (IsStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
+                AppendMenuW(hMenu, MF_STRING | (startupOn ? MF_CHECKED : MF_UNCHECKED),
                     IDM_STARTUP, L"Run on startup");
-
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
 
@@ -370,11 +350,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDM_SHOW:
-            if (IsWindowVisible(hwnd)) {
+            if (IsWindowVisible(hwnd))
                 ShowWindow(hwnd, SW_HIDE);
-            } else {
+            else
                 ShowMainWindow();
-            }
             break;
 
         case IDM_EXIT:
@@ -388,25 +367,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case IDM_ABOUT:
-            MessageBoxW(hwnd, 
+            MessageBoxW(hwnd,
                 L"AutoAffinity v1.0\n\n"
                 L"Automatically sets CPU affinity for specific games to improve performance on hybrid architectures.\n"
                 L"Excludes CPUs 0 and 1 by default.\n\n"
-                L"Author: Besss", 
+                L"Author: Besss\n"
+                L"https://github.com/AlexanderBesss/AutoAffinity",
                 L"About AutoAffinity", MB_OK | MB_ICONINFORMATION);
             break;
         }
         return 0;
 
-    case WM_LOG_MSG: {
-        auto* s = reinterpret_cast<std::wstring*>(lp);
-        AppendLog(*s);
-        delete s;
-        return 0;
-    }
-
     case WM_DESTROY:
-        g_running = false;
+        KillTimer(hwnd, ID_TIMER_POLL);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         if (g_hFont) { DeleteObject(g_hFont); g_hFont = nullptr; }
         PostQuitMessage(0);
@@ -419,10 +392,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // Entry point
 // ---------------------------------------------------------------------------
 
-int main() {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nShowCmd) {
+    g_hInst = hInstance;
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"AutoAffinityMutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(hMutex);
+    if (!hMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (hMutex) CloseHandle(hMutex);
         return 0;
     }
 
@@ -437,10 +411,6 @@ int main() {
         CloseHandle(hMutex);
         return 1;
     }
-
-    RegisterStartup();
-
-    g_hInst = GetModuleHandleW(nullptr);
 
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.lpfnWndProc   = WndProc;
@@ -471,15 +441,14 @@ int main() {
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     {
-        std::wostringstream ss;
-        ss << L"AutoAffinity started  |  affinity mask 0x"
-           << std::hex << g_affinityMask
-           << L"  |  CPUs 0+1 excluded  |  poll 20s";
-        AppendLog(ss.str());
+        wchar_t buf[256];
+        swprintf_s(buf, L"AutoAffinity started  |  affinity mask 0x%llX  |  CPUs 0+1 excluded  |  poll 20s",
+            (unsigned long long)g_affinityMask);
+        AppendLog(buf);
         AppendLog(L"Double-click the tray icon to open this window.");
     }
 
-    std::thread watcher(WatcherThread);
+    WatcherTick(); // run immediately on start, then every k_pollMs via timer
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -487,8 +456,6 @@ int main() {
         DispatchMessageW(&msg);
     }
 
-    g_running = false;
-    if (watcher.joinable()) watcher.join();
     CloseHandle(hMutex);
     return 0;
 }
