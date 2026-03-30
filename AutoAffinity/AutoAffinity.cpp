@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include "resource.h"
 #include <commctrl.h>
 #include <tlhelp32.h>
 #include <string>
@@ -15,21 +16,19 @@
 #include <atomic>
 #include <thread>
 
-// Custom messages
 #define WM_TRAYICON  (WM_APP + 1)
 #define WM_LOG_MSG   (WM_APP + 2)
 
-// Menu IDs
 #define IDM_SHOW     1001
 #define IDM_EXIT     1002
+#define IDM_STARTUP  1003
+#define IDM_ABOUT    1004
 
-// Control IDs
 #define ID_EDIT_LOG  100
 #define ID_STATUSBAR 101
-
-// Tray
 #define TRAY_ICON_ID 1
 
+static HINSTANCE         g_hInst        = nullptr;
 static HWND              g_hwnd         = nullptr;
 static HWND              g_hEdit        = nullptr;
 static HWND              g_hStatus      = nullptr;
@@ -37,6 +36,9 @@ static NOTIFYICONDATAW   g_nid          = {};
 static std::atomic<bool> g_running      { true };
 static DWORD_PTR         g_affinityMask = 0;
 static HFONT             g_hFont        = nullptr;
+
+static const std::vector<std::wstring> k_targets = { L"cs2.exe", L"dota2.exe" };
+static const DWORD k_pollMs = 20000;
 
 // ---------------------------------------------------------------------------
 // Affinity mask
@@ -49,7 +51,7 @@ static DWORD_PTR BuildAffinityMask() {
 }
 
 // ---------------------------------------------------------------------------
-// Thread-safe logging — posts a heap-allocated string to the main window
+// Thread-safe logging
 // ---------------------------------------------------------------------------
 
 static void Log(const wchar_t* level, const std::wstring& msg) {
@@ -123,10 +125,10 @@ static void CheckAndApply(DWORD pid, const wchar_t* name, bool isNew) {
 }
 
 static std::map<std::wstring, std::set<DWORD>> SnapshotTargets(
-    const std::vector<const wchar_t*>& targets)
+    const std::vector<std::wstring>& targets)
 {
     std::map<std::wstring, std::set<DWORD>> result;
-    for (auto t : targets) result[t];
+    for (const auto& t : targets) result[t];
 
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return result;
@@ -147,18 +149,49 @@ static std::map<std::wstring, std::set<DWORD>> SnapshotTargets(
 // Startup registration
 // ---------------------------------------------------------------------------
 
-static void RegisterStartup() {
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
+static bool IsStartupRegistered() {
+    HKEY hKey;
+    bool registered = false;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    {
+        wchar_t value[MAX_PATH];
+        DWORD size = sizeof(value);
+        if (RegQueryValueExW(hKey, L"AutoAffinity", nullptr, nullptr,
+            reinterpret_cast<BYTE*>(value), &size) == ERROR_SUCCESS)
+        {
+            registered = true;
+        }
+        RegCloseKey(hKey);
+    }
+    return registered;
+}
+
+static void UpdateStartupRegistration(bool enable) {
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
         L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
         0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
     {
-        RegSetValueExW(hKey, L"AutoAffinity", 0, REG_SZ,
-            reinterpret_cast<const BYTE*>(path),
-            static_cast<DWORD>((wcslen(path) + 1) * sizeof(wchar_t)));
+        if (enable) {
+            wchar_t path[MAX_PATH];
+            GetModuleFileNameW(nullptr, path, MAX_PATH);
+            RegSetValueExW(hKey, L"AutoAffinity", 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(path),
+                static_cast<DWORD>((wcslen(path) + 1) * sizeof(wchar_t)));
+        } else {
+            RegDeleteValueW(hKey, L"AutoAffinity");
+        }
         RegCloseKey(hKey);
+    }
+}
+
+static void RegisterStartup() {
+    // This is called on first run or every run to ensure it's there
+    // For now we keep it simple - we can make it toggleable
+    if (!IsStartupRegistered()) {
+        UpdateStartupRegistration(true);
     }
 }
 
@@ -167,14 +200,11 @@ static void RegisterStartup() {
 // ---------------------------------------------------------------------------
 
 static void WatcherThread() {
-    const std::vector<const wchar_t*> targets = { L"cs2.exe", L"dota2.exe" };
-    const DWORD pollMs = 20000;
-
     std::map<std::wstring, std::set<DWORD>> known;
-    for (auto t : targets) known[t];
+    for (const auto& t : k_targets) known[t];
 
     while (g_running) {
-        auto current = SnapshotTargets(targets);
+        auto current = SnapshotTargets(k_targets);
 
         for (auto& [name, pids] : current) {
             auto& knownPids = known[name];
@@ -196,7 +226,7 @@ static void WatcherThread() {
                 }
         }
 
-        for (DWORD i = 0; i < pollMs / 200 && g_running; ++i)
+        for (DWORD i = 0; i < k_pollMs / 200 && g_running; ++i)
             Sleep(200);
     }
 }
@@ -206,18 +236,17 @@ static void WatcherThread() {
 // ---------------------------------------------------------------------------
 
 static void AppendLog(const std::wstring& line) {
-    // Keep at most 1000 lines — trim the first 200 when exceeded
-    int lineCount = (int)SendMessageW(g_hEdit, EM_GETLINECOUNT, 0, 0);
-    if (lineCount > 1000) {
+    // Keep at most 1000 lines - trim the first 200 when exceeded
+    if (SendMessageW(g_hEdit, EM_GETLINECOUNT, 0, 0) > 1000) {
         LRESULT trimTo = SendMessageW(g_hEdit, EM_LINEINDEX, 200, 0);
         SendMessageW(g_hEdit, EM_SETSEL, 0, trimTo);
         SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
     }
 
-    std::wstring text = line + L"\r\n";
     LRESULT len = SendMessageW(g_hEdit, WM_GETTEXTLENGTH, 0, 0);
     SendMessageW(g_hEdit, EM_SETSEL, len, len);
-    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
+    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
+    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
     SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
 }
 
@@ -246,35 +275,52 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
 
     case WM_CREATE: {
-        // Multiline read-only edit for the log
         g_hEdit = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL |
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0, 0, 0, 0,
-            hwnd, (HMENU)ID_EDIT_LOG,
-            GetModuleHandleW(nullptr), nullptr);
+            hwnd, (HMENU)ID_EDIT_LOG, g_hInst, nullptr);
 
-        // Consolas 9pt
         HDC hdc = GetDC(nullptr);
-        int lpy = GetDeviceCaps(hdc, LOGPIXELSY);
-        ReleaseDC(nullptr, hdc);
         g_hFont = CreateFontW(
-            -MulDiv(9, lpy, 72), 0, 0, 0, FW_NORMAL,
+            -MulDiv(9, GetDeviceCaps(hdc, LOGPIXELSY), 72), 0, 0, 0, FW_NORMAL,
             FALSE, FALSE, FALSE, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+        ReleaseDC(nullptr, hdc);
         SendMessageW(g_hEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
-        // Status bar
         g_hStatus = CreateWindowExW(
             0, STATUSCLASSNAMEW, nullptr,
             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
             0, 0, 0, 0,
-            hwnd, (HMENU)ID_STATUSBAR,
-            GetModuleHandleW(nullptr), nullptr);
+            hwnd, (HMENU)ID_STATUSBAR, g_hInst, nullptr);
         SendMessageW(g_hStatus, SB_SETTEXTW, 0,
             (LPARAM)L"Watching: cs2.exe, dota2.exe  |  Poll: 20s");
+
+        // Create main menu
+        HMENU hMenuBar = CreateMenu();
+        HMENU hFileMenu = CreatePopupMenu();
+        AppendMenuW(hFileMenu, MF_STRING, IDM_EXIT, L"E&xit");
+        AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hFileMenu, L"&File");
+
+        HMENU hSettingsMenu = CreatePopupMenu();
+        AppendMenuW(hSettingsMenu, MF_STRING, IDM_STARTUP, L"&Run on startup");
+        AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hSettingsMenu, L"&Settings");
+
+        HMENU hHelpMenu = CreatePopupMenu();
+        AppendMenuW(hHelpMenu, MF_STRING, IDM_ABOUT, L"&About");
+        AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hHelpMenu, L"&Help");
+
+        SetMenu(hwnd, hMenuBar);
+        return 0;
+    }
+
+    case WM_INITMENUPOPUP: {
+        HMENU hMenu = (HMENU)wp;
+        // Check "Run on startup" if it's registered
+        CheckMenuItem(hMenu, IDM_STARTUP, MF_BYCOMMAND | (IsStartupRegistered() ? MF_CHECKED : MF_UNCHECKED));
         return 0;
     }
 
@@ -283,7 +329,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             LayoutChildren(hwnd);
         return 0;
 
-    // Hide to tray when user clicks the minimize button
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_MINIMIZE) {
             ShowWindow(hwnd, SW_HIDE);
@@ -291,7 +336,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
 
-    // Hide to tray when user clicks X
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);
         return 0;
@@ -303,28 +347,54 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
-            bool visible = IsWindowVisible(hwnd) != 0;
-            AppendMenuW(hMenu, MF_STRING, IDM_SHOW,
-                        visible ? L"Hide window" : L"Show window");
-            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
-            SetForegroundWindow(hwnd);
-            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-                           pt.x, pt.y, 0, hwnd, nullptr);
-            DestroyMenu(hMenu);
+            if (hMenu) {
+                AppendMenuW(hMenu, MF_STRING, IDM_SHOW,
+                    IsWindowVisible(hwnd) ? L"Hide window" : L"Show window");
+
+                // Add startup toggle to tray as well
+                AppendMenuW(hMenu, MF_STRING | (IsStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
+                    IDM_STARTUP, L"Run on startup");
+
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
+
+                SetForegroundWindow(hwnd);
+                TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+                               pt.x, pt.y, 0, hwnd, nullptr);
+                PostMessageW(hwnd, WM_NULL, 0, 0);
+                DestroyMenu(hMenu);
+            }
         }
         return 0;
 
     case WM_COMMAND:
-        if (LOWORD(wp) == IDM_SHOW) {
-            if (IsWindowVisible(hwnd))
+        switch (LOWORD(wp)) {
+        case IDM_SHOW:
+            if (IsWindowVisible(hwnd)) {
                 ShowWindow(hwnd, SW_HIDE);
-            else
+            } else {
                 ShowMainWindow();
-        } else if (LOWORD(wp) == IDM_EXIT) {
-            g_running = false;
-            Shell_NotifyIconW(NIM_DELETE, &g_nid);
+            }
+            break;
+
+        case IDM_EXIT:
             DestroyWindow(hwnd);
+            break;
+
+        case IDM_STARTUP: {
+            bool current = IsStartupRegistered();
+            UpdateStartupRegistration(!current);
+            break;
+        }
+
+        case IDM_ABOUT:
+            MessageBoxW(hwnd, 
+                L"AutoAffinity v1.0\n\n"
+                L"Automatically sets CPU affinity for specific games to improve performance on hybrid architectures.\n"
+                L"Excludes CPUs 0 and 1 by default.\n\n"
+                L"Author: Besss", 
+                L"About AutoAffinity", MB_OK | MB_ICONINFORMATION);
+            break;
         }
         return 0;
 
@@ -370,35 +440,36 @@ int main() {
 
     RegisterStartup();
 
-    // Register window class
+    g_hInst = GetModuleHandleW(nullptr);
+
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = GetModuleHandleW(nullptr);
-    wc.hIcon         = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hInstance     = g_hInst;
+    wc.hIcon         = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_APPICON),
+                           IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+    wc.hIconSm       = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_APPICON),
+                           IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
     wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = L"AutoAffinityWnd";
-    if (!RegisterClassExW(&wc)) return 1;
+    if (!RegisterClassExW(&wc)) { CloseHandle(hMutex); return 1; }
 
-    // Create window (hidden — lives in tray until user opens it)
     g_hwnd = CreateWindowExW(
         0, L"AutoAffinityWnd", L"AutoAffinity",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 660, 440,
-        nullptr, nullptr, wc.hInstance, nullptr);
-    if (!g_hwnd) return 1;
+        nullptr, nullptr, g_hInst, nullptr);
+    if (!g_hwnd) { CloseHandle(hMutex); return 1; }
 
-    // Tray icon
     g_nid.cbSize           = sizeof(g_nid);
     g_nid.hWnd             = g_hwnd;
     g_nid.uID              = TRAY_ICON_ID;
     g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon            = LoadIconW(nullptr, IDI_APPLICATION);
+    g_nid.hIcon            = wc.hIconSm;
     wcsncpy_s(g_nid.szTip, L"AutoAffinity - watching", _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
-    // Initial log line (window is created, controls exist)
     {
         std::wostringstream ss;
         ss << L"AutoAffinity started  |  affinity mask 0x"
