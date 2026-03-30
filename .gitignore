@@ -1,0 +1,6 @@
+.claude
+x64
+x86
+*.log
+.vs
+*.vcxproj.user

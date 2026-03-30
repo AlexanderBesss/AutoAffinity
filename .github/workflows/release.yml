@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release x64
+        run: |
+          msbuild AutoAffinity.slnx `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /m /nologo /v:minimal
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Build #${{ github.run_number }}"
+          body: |
+            Commit: ${{ github.sha }}
+            Message: ${{ github.event.head_commit.message }}
+          files: x64/Release/AutoAffinity.exe
+          fail_on_unmatched_files: true
