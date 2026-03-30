@@ -20,7 +20,7 @@ extern "C" void* memset(void* dest, int c, size_t count) {
 #define ID_EDIT_LOG   100
 #define ID_STATUSBAR  101
 #define ID_TIMER_POLL 102
-#define TRAY_ICON_ID  1
+static const UINT      TRAY_ICON_ID  = 1;
 
 static HINSTANCE       g_hInst        = nullptr;
 static HWND            g_hwnd         = nullptr;
@@ -30,16 +30,63 @@ static NOTIFYICONDATAW g_nid          = {};
 static DWORD_PTR       g_affinityMask = 0;
 static HFONT           g_hFont        = nullptr;
 
-static const wchar_t* const k_targets[] = { L"cs2.exe", L"dota2.exe" };
-static constexpr int   k_numTargets = ARRAYSIZE(k_targets);
-static const UINT      k_pollMs     = 20000;
+static wchar_t g_iniPath[MAX_PATH];
+static FILETIME g_lastConfigTime;
+
+#define MAX_TARGETS 16
+static wchar_t g_targets[MAX_TARGETS][MAX_PATH];
+static int     g_numTargets = 0;
+static UINT    g_pollMs     = 20000;
 static constexpr int   k_maxPids    = 8; // max tracked PIDs per target
 
 struct TargetState {
     DWORD pids[k_maxPids];
     int   count;
 };
-static TargetState g_known[k_numTargets] = {};
+static TargetState g_known[MAX_TARGETS] = {};
+
+// ---------------------------------------------------------------------------
+// Config loading
+// ---------------------------------------------------------------------------
+
+static void LoadConfig() {
+    if (GetFileAttributesW(g_iniPath) == INVALID_FILE_ATTRIBUTES) {
+        WritePrivateProfileStringW(L"Process1", L"name", L"cs2.exe", g_iniPath);
+        WritePrivateProfileStringW(L"Process1", L"priority", L"high", g_iniPath);
+        WritePrivateProfileStringW(L"Process2", L"name", L"dota2.exe", g_iniPath);
+        WritePrivateProfileStringW(L"Process2", L"priority", L"high", g_iniPath);
+        WritePrivateProfileStringW(L"Settings", L"pollMs", L"20000", g_iniPath);
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attr;
+    if (GetFileAttributesExW(g_iniPath, GetFileExInfoStandard, &attr)) {
+        g_lastConfigTime = attr.ftLastWriteTime;
+    }
+
+    g_pollMs = GetPrivateProfileIntW(L"Settings", L"pollMs", 20000, g_iniPath);
+
+    g_numTargets = 0;
+    for (int i = 1; i <= MAX_TARGETS; ++i) {
+        wchar_t section[32];
+        wsprintfW(section, L"Process%d", i);
+
+        wchar_t name[MAX_PATH];
+        GetPrivateProfileStringW(section, L"name", L"", name, MAX_PATH, g_iniPath);
+
+        if (name[0] != L'\0') {
+            lstrcpyW(g_targets[g_numTargets], name);
+            g_numTargets++;
+        } else {
+            break;
+        }
+    }
+
+    if (g_numTargets == 0) {
+        lstrcpyW(g_targets[0], L"cs2.exe");
+        lstrcpyW(g_targets[1], L"dota2.exe");
+        g_numTargets = 2;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Affinity mask
@@ -142,39 +189,102 @@ static bool ContainsPid(const TargetState& ts, DWORD pid) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// GUI helpers
+// ---------------------------------------------------------------------------
+
+static void UpdateTrayTip() {
+    wchar_t tip[128] = L"AutoAffinity - watching: ";
+    for (int i = 0; i < g_numTargets; ++i) {
+        int len = lstrlenW(tip);
+        if (len + lstrlenW(g_targets[i]) + 2 < 128) {
+            lstrcatW(tip, g_targets[i]);
+            if (i < g_numTargets - 1) lstrcatW(tip, L", ");
+        } else {
+            lstrcatW(tip, L"...");
+            break;
+        }
+    }
+    lstrcpynW(g_nid.szTip, tip, ARRAYSIZE(g_nid.szTip));
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+static void UpdateUI() {
+    wchar_t statusBuf[512];
+    lstrcpyW(statusBuf, L"Watching: ");
+    for (int i = 0; i < g_numTargets; ++i) {
+        lstrcatW(statusBuf, g_targets[i]);
+        if (i < g_numTargets - 1) lstrcatW(statusBuf, L", ");
+    }
+    wchar_t pollBuf[64];
+    wsprintfW(pollBuf, L"  |  Poll: %us", g_pollMs / 1000);
+    lstrcatW(statusBuf, pollBuf);
+
+    SetWindowTextW(g_hStatus, statusBuf);
+    UpdateTrayTip();
+}
+
+static void ShowMainWindow() {
+    ShowWindow(g_hwnd, SW_SHOW);
+    ShowWindow(g_hwnd, SW_RESTORE);
+    SetForegroundWindow(g_hwnd);
+}
+
+static constexpr int k_statusH = 22;
+
+static void LayoutChildren(HWND hwnd) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    SetWindowPos(g_hEdit, nullptr, 0, 0,
+        rc.right, rc.bottom - k_statusH, SWP_NOZORDER);
+    SetWindowPos(g_hStatus, nullptr, 0, rc.bottom - k_statusH,
+        rc.right, k_statusH, SWP_NOZORDER);
+}
+
 static void WatcherTick() {
+    // Check if config file was modified
+    WIN32_FILE_ATTRIBUTE_DATA attr;
+    if (GetFileAttributesExW(g_iniPath, GetFileExInfoStandard, &attr)) {
+        if (CompareFileTime(&attr.ftLastWriteTime, &g_lastConfigTime) != 0) {
+            Log(L"[*]", L"Config change detected, reloading...");
+            LoadConfig();
+            UpdateUI();
+            SetTimer(g_hwnd, ID_TIMER_POLL, g_pollMs, nullptr);
+        }
+    }
+
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
 
     // Collect current PIDs per target
-    TargetState current[k_numTargets] = {};
+    TargetState current[MAX_TARGETS] = {};
 
     PROCESSENTRY32W pe{ sizeof(pe) };
     if (Process32FirstW(hSnap, &pe))
         do {
-            for (int i = 0; i < k_numTargets; ++i)
-                if (lstrcmpiW(pe.szExeFile, k_targets[i]) == 0
+            for (int i = 0; i < g_numTargets; ++i)
+                if (lstrcmpiW(pe.szExeFile, g_targets[i]) == 0
                     && current[i].count < k_maxPids)
                     current[i].pids[current[i].count++] = pe.th32ProcessID;
         } while (Process32NextW(hSnap, &pe));
 
     CloseHandle(hSnap);
 
-    for (int i = 0; i < k_numTargets; ++i) {
+    for (int i = 0; i < g_numTargets; ++i) {
         // Check new/existing PIDs
         for (int j = 0; j < current[i].count; ++j) {
             DWORD pid = current[i].pids[j];
             bool isNew = !ContainsPid(g_known[i], pid);
             if (isNew && g_known[i].count < k_maxPids)
                 g_known[i].pids[g_known[i].count++] = pid;
-            CheckAndApply(pid, k_targets[i], isNew);
+            CheckAndApply(pid, g_targets[i], isNew);
         }
 
         // Remove exited PIDs
         for (int j = g_known[i].count - 1; j >= 0; --j) {
             if (!ContainsPid(current[i], g_known[i].pids[j])) {
                 wchar_t s[256];
-                wsprintfW(s, L"%s (PID %lu) exited.", k_targets[i], g_known[i].pids[j]);
+                wsprintfW(s, L"%s (PID %lu) exited.", g_targets[i], g_known[i].pids[j]);
                 Log(L"[-]", s);
                 g_known[i].pids[j] = g_known[i].pids[--g_known[i].count];
             }
@@ -225,27 +335,6 @@ static void UpdateStartupRegistration(bool enable) {
 }
 
 // ---------------------------------------------------------------------------
-// GUI helpers
-// ---------------------------------------------------------------------------
-
-static void ShowMainWindow() {
-    ShowWindow(g_hwnd, SW_SHOW);
-    ShowWindow(g_hwnd, SW_RESTORE);
-    SetForegroundWindow(g_hwnd);
-}
-
-static constexpr int k_statusH = 22;
-
-static void LayoutChildren(HWND hwnd) {
-    RECT rc;
-    GetClientRect(hwnd, &rc);
-    SetWindowPos(g_hEdit, nullptr, 0, 0,
-        rc.right, rc.bottom - k_statusH, SWP_NOZORDER);
-    SetWindowPos(g_hStatus, nullptr, 0, rc.bottom - k_statusH,
-        rc.right, k_statusH, SWP_NOZORDER);
-}
-
-// ---------------------------------------------------------------------------
 // Window procedure
 // ---------------------------------------------------------------------------
 
@@ -271,12 +360,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_hStatus = CreateWindowExW(
             WS_EX_STATICEDGE, L"STATIC",
-            L"Watching: cs2.exe, dota2.exe  |  Poll: 20s",
+            L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
             0, 0, 0, 0,
             hwnd, (HMENU)ID_STATUSBAR, g_hInst, nullptr);
         SendMessageW(g_hStatus, WM_SETFONT,
             (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+
+        UpdateUI();
 
         // Create main menu
         HMENU hMenuBar = CreateMenu();
@@ -294,7 +385,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         SetMenu(hwnd, hMenuBar);
 
-        SetTimer(hwnd, ID_TIMER_POLL, k_pollMs, nullptr);
+        SetTimer(hwnd, ID_TIMER_POLL, g_pollMs, nullptr);
         return 0;
     }
 
@@ -397,11 +488,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nShowCmd) {
     g_hInst = hInstance;
+
+    if (GetModuleFileNameW(nullptr, g_iniPath, MAX_PATH)) {
+        wchar_t* lastSlash = nullptr;
+        for (wchar_t* p = g_iniPath; *p; ++p) if (*p == L'\\') lastSlash = p;
+        if (lastSlash) *(lastSlash + 1) = L'\0';
+        lstrcatW(g_iniPath, L"config.ini");
+    } else {
+        lstrcpyW(g_iniPath, L".\\config.ini");
+    }
+
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"AutoAffinityMutex");
     if (!hMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
         if (hMutex) CloseHandle(hMutex);
         return 0;
     }
+
+    LoadConfig();
 
     g_affinityMask = BuildAffinityMask();
     if (g_affinityMask == 0) {
@@ -437,13 +540,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon            = wc.hIconSm;
-    lstrcpynW(g_nid.szTip, L"AutoAffinity - watching", ARRAYSIZE(g_nid.szTip));
+    {
+        wchar_t tip[128] = L"AutoAffinity - watching: ";
+        for (int i = 0; i < g_numTargets; ++i) {
+            int len = lstrlenW(tip);
+            if (len + lstrlenW(g_targets[i]) + 2 < 128) {
+                lstrcatW(tip, g_targets[i]);
+                if (i < g_numTargets - 1) lstrcatW(tip, L", ");
+            } else {
+                lstrcatW(tip, L"...");
+                break;
+            }
+        }
+        lstrcpynW(g_nid.szTip, tip, ARRAYSIZE(g_nid.szTip));
+    }
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     {
         wchar_t buf[256];
-        wsprintfW(buf, L"AutoAffinity started  |  affinity mask 0x%IX  |  CPUs 0+1 excluded  |  poll 20s",
-            g_affinityMask);
+        wsprintfW(buf, L"AutoAffinity started  |  affinity mask 0x%IX  |  CPUs 0+1 excluded  |  poll %us",
+            g_affinityMask, g_pollMs / 1000);
         AppendLog(buf);
         AppendLog(L"Double-click the tray icon to open this window.");
     }
