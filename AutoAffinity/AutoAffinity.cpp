@@ -1,12 +1,14 @@
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "comctl32.lib")
-
 #include <windows.h>
 #include <shellapi.h>
 #include "resource.h"
-#include <commctrl.h>
 #include <tlhelp32.h>
-#include <stdio.h>
+
+#pragma function(memset)
+extern "C" void* memset(void* dest, int c, size_t count) {
+    unsigned char* d = static_cast<unsigned char*>(dest);
+    while (count--) *d++ = static_cast<unsigned char>(c);
+    return dest;
+}
 
 #define WM_TRAYICON  (WM_APP + 1)
 
@@ -29,7 +31,7 @@ static DWORD_PTR       g_affinityMask = 0;
 static HFONT           g_hFont        = nullptr;
 
 static const wchar_t* const k_targets[] = { L"cs2.exe", L"dota2.exe" };
-static constexpr int   k_numTargets = _countof(k_targets);
+static constexpr int   k_numTargets = ARRAYSIZE(k_targets);
 static const UINT      k_pollMs     = 20000;
 static constexpr int   k_maxPids    = 8; // max tracked PIDs per target
 
@@ -72,7 +74,7 @@ static void Log(const wchar_t* level, const wchar_t* msg) {
     SYSTEMTIME st{};
     GetLocalTime(&st);
     wchar_t buf[512];
-    swprintf_s(buf, L"[%02hu:%02hu:%02hu] %s %s",
+    wsprintfW(buf, L"[%02u:%02u:%02u] %s %s",
         st.wHour, st.wMinute, st.wSecond, level, msg);
     AppendLog(buf);
 }
@@ -86,7 +88,7 @@ static void CheckAndApply(DWORD pid, const wchar_t* name, bool isNew) {
         PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, pid);
     if (!h) {
         wchar_t s[256];
-        swprintf_s(s, L"%s PID %lu - OpenProcess failed (%lu)", name, pid, GetLastError());
+        wsprintfW(s, L"%s PID %lu - OpenProcess failed (%lu)", name, pid, GetLastError());
         Log(L"[!]", s);
         return;
     }
@@ -103,7 +105,7 @@ static void CheckAndApply(DWORD pid, const wchar_t* name, bool isNew) {
 
     {
         wchar_t s[256];
-        swprintf_s(s, L"%s (PID %lu)%s", name, pid,
+        wsprintfW(s, L"%s (PID %lu)%s", name, pid,
             isNew ? L" - new process" : L" - drift detected, reapplying");
         Log(L"[*]", s);
     }
@@ -113,7 +115,7 @@ static void CheckAndApply(DWORD pid, const wchar_t* name, bool isNew) {
             Log(L"[+]", L"    Priority  -> High");
         else {
             wchar_t e[128];
-            swprintf_s(e, L"    SetPriorityClass failed (%lu)", GetLastError());
+            wsprintfW(e, L"    SetPriorityClass failed (%lu)", GetLastError());
             Log(L"[!]", e);
         }
     }
@@ -121,12 +123,12 @@ static void CheckAndApply(DWORD pid, const wchar_t* name, bool isNew) {
     if (affinityDrifted || isNew) {
         if (SetProcessAffinityMask(h, g_affinityMask)) {
             wchar_t a[128];
-            swprintf_s(a, L"    Affinity  -> 0x%llX (CPUs 0+1 excluded)",
-                (unsigned long long)g_affinityMask);
+            wsprintfW(a, L"    Affinity  -> 0x%IX (CPUs 0+1 excluded)",
+                g_affinityMask);
             Log(L"[+]", a);
         } else {
             wchar_t e[128];
-            swprintf_s(e, L"    SetProcessAffinityMask failed (%lu)", GetLastError());
+            wsprintfW(e, L"    SetProcessAffinityMask failed (%lu)", GetLastError());
             Log(L"[!]", e);
         }
     }
@@ -151,7 +153,7 @@ static void WatcherTick() {
     if (Process32FirstW(hSnap, &pe))
         do {
             for (int i = 0; i < k_numTargets; ++i)
-                if (_wcsicmp(pe.szExeFile, k_targets[i]) == 0
+                if (lstrcmpiW(pe.szExeFile, k_targets[i]) == 0
                     && current[i].count < k_maxPids)
                     current[i].pids[current[i].count++] = pe.th32ProcessID;
         } while (Process32NextW(hSnap, &pe));
@@ -172,7 +174,7 @@ static void WatcherTick() {
         for (int j = g_known[i].count - 1; j >= 0; --j) {
             if (!ContainsPid(current[i], g_known[i].pids[j])) {
                 wchar_t s[256];
-                swprintf_s(s, L"%s (PID %lu) exited.", k_targets[i], g_known[i].pids[j]);
+                wsprintfW(s, L"%s (PID %lu) exited.", k_targets[i], g_known[i].pids[j]);
                 Log(L"[-]", s);
                 g_known[i].pids[j] = g_known[i].pids[--g_known[i].count];
             }
@@ -214,7 +216,7 @@ static void UpdateStartupRegistration(bool enable) {
             GetModuleFileNameW(nullptr, path, MAX_PATH);
             RegSetValueExW(hKey, L"AutoAffinity", 0, REG_SZ,
                 reinterpret_cast<const BYTE*>(path),
-                static_cast<DWORD>((wcslen(path) + 1) * sizeof(wchar_t)));
+                static_cast<DWORD>((lstrlenW(path) + 1) * sizeof(wchar_t)));
         } else {
             RegDeleteValueW(hKey, L"AutoAffinity");
         }
@@ -232,15 +234,15 @@ static void ShowMainWindow() {
     SetForegroundWindow(g_hwnd);
 }
 
+static constexpr int k_statusH = 22;
+
 static void LayoutChildren(HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
-    RECT sr;
-    GetWindowRect(g_hStatus, &sr);
-    int statusH = sr.bottom - sr.top;
     SetWindowPos(g_hEdit, nullptr, 0, 0,
-        rc.right, rc.bottom - statusH, SWP_NOZORDER);
-    SendMessageW(g_hStatus, WM_SIZE, 0, 0);
+        rc.right, rc.bottom - k_statusH, SWP_NOZORDER);
+    SetWindowPos(g_hStatus, nullptr, 0, rc.bottom - k_statusH,
+        rc.right, k_statusH, SWP_NOZORDER);
 }
 
 // ---------------------------------------------------------------------------
@@ -268,12 +270,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_hEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
         g_hStatus = CreateWindowExW(
-            0, STATUSCLASSNAMEW, nullptr,
-            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+            WS_EX_STATICEDGE, L"STATIC",
+            L"Watching: cs2.exe, dota2.exe  |  Poll: 20s",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
             0, 0, 0, 0,
             hwnd, (HMENU)ID_STATUSBAR, g_hInst, nullptr);
-        SendMessageW(g_hStatus, SB_SETTEXTW, 0,
-            (LPARAM)L"Watching: cs2.exe, dota2.exe  |  Poll: 20s");
+        SendMessageW(g_hStatus, WM_SETFONT,
+            (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 
         // Create main menu
         HMENU hMenuBar = CreateMenu();
@@ -400,9 +403,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         return 0;
     }
 
-    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES };
-    InitCommonControlsEx(&icc);
-
     g_affinityMask = BuildAffinityMask();
     if (g_affinityMask == 0) {
         MessageBoxW(nullptr,
@@ -437,13 +437,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon            = wc.hIconSm;
-    wcsncpy_s(g_nid.szTip, L"AutoAffinity - watching", _TRUNCATE);
+    lstrcpynW(g_nid.szTip, L"AutoAffinity - watching", ARRAYSIZE(g_nid.szTip));
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     {
         wchar_t buf[256];
-        swprintf_s(buf, L"AutoAffinity started  |  affinity mask 0x%llX  |  CPUs 0+1 excluded  |  poll 20s",
-            (unsigned long long)g_affinityMask);
+        wsprintfW(buf, L"AutoAffinity started  |  affinity mask 0x%IX  |  CPUs 0+1 excluded  |  poll 20s",
+            g_affinityMask);
         AppendLog(buf);
         AppendLog(L"Double-click the tray icon to open this window.");
     }
@@ -458,4 +458,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 
     CloseHandle(hMutex);
     return 0;
+}
+
+extern "C" void __stdcall Entry() {
+    ExitProcess((UINT)wWinMain(GetModuleHandleW(nullptr), nullptr, nullptr, 0));
 }

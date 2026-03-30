@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="AutoAffinity/AutoAffinity.vcxproj" />
+  <Project Path="AutoAffinity/AutoAffinity.vcxproj" Id="78d24ec3-e7a0-4600-8965-921407c9006b" />
 </Solution>
