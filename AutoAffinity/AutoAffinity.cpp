@@ -30,7 +30,7 @@ static NOTIFYICONDATAW g_nid          = {};
 static DWORD_PTR       g_affinityMask = 0;
 static HFONT           g_hFont        = nullptr;
 
-static const wchar_t* const k_targets[] = { L"cs2.exe", L"dota2.exe" };
+static const wchar_t* const k_targets[] = { L"cs2.exe", L"dota2.exe", L"FPSAimTrainer-Win64-Shipping.exe", L"AimLab_tb.exe" };
 static constexpr int   k_numTargets = ARRAYSIZE(k_targets);
 static const UINT      k_pollMs     = 20000;
 static constexpr int   k_maxPids    = 8; // max tracked PIDs per target
@@ -269,9 +269,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ReleaseDC(nullptr, hdc);
         SendMessageW(g_hEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
+        wchar_t statusText[512] = L"Watching: ";
+        for (int i = 0; i < k_numTargets; ++i) {
+            if (i > 0) lstrcatW(statusText, L", ");
+            lstrcatW(statusText, k_targets[i]);
+        }
+        lstrcatW(statusText, L"  |  Poll: 20s");
+
         g_hStatus = CreateWindowExW(
             WS_EX_STATICEDGE, L"STATIC",
-            L"Watching: cs2.exe, dota2.exe  |  Poll: 20s",
+            statusText,
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
             0, 0, 0, 0,
             hwnd, (HMENU)ID_STATUSBAR, g_hInst, nullptr);
